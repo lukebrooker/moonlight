@@ -1,0 +1,17 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# py2app
+build/
+dist/
+
+# Generated icon assets (rebuilt by build_icon.py)
+Moonlight.iconset/
+icon.icns
+
+# macOS
+.DS_Store

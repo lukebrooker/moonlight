@@ -1,0 +1,93 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version string (e.g. 1.0.0-rc1). Leave blank for 0.0.0-dev."
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build Moonlight.app
+    runs-on: macos-14  # Apple Silicon
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Resolve version
+        id: version
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            RAW="${GITHUB_REF_NAME}"
+          elif [ -n "${{ github.event.inputs.version }}" ]; then
+            RAW="${{ github.event.inputs.version }}"
+          else
+            RAW="0.0.0-dev"
+          fi
+          VERSION="${RAW#v}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Resolved version: $VERSION"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip install 'py2app>=0.28.10'
+
+      - name: Build release bundle
+        env:
+          MOONLIGHT_VERSION: ${{ steps.version.outputs.version }}
+        run: ./build_release.sh
+
+      - name: Smoke test — Info.plist
+        run: |
+          PLIST="dist/Moonlight.app/Contents/Info.plist"
+          /usr/libexec/PlistBuddy -c "Print :CFBundleName" "$PLIST"
+          /usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$PLIST"
+          /usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$PLIST"
+
+      - name: Smoke test — libportaudio.dylib bundled
+        run: |
+          MATCHES=$(find dist/Moonlight.app -name "libportaudio*.dylib" | head)
+          if [ -z "$MATCHES" ]; then
+            echo "ERROR: libportaudio.dylib not found inside bundle" >&2
+            exit 1
+          fi
+          echo "Found: $MATCHES"
+
+      - name: Smoke test — CoreBluetooth bindings bundled
+        run: |
+          MATCHES=$(find dist/Moonlight.app -path "*CoreBluetooth*" | head)
+          if [ -z "$MATCHES" ]; then
+            echo "ERROR: CoreBluetooth pyobjc bindings not found inside bundle" >&2
+            exit 1
+          fi
+          echo "Found: $MATCHES"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Moonlight-${{ steps.version.outputs.version }}-arm64
+          path: dist/Moonlight-${{ steps.version.outputs.version }}-arm64.zip
+          if-no-files-found: error
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/Moonlight-${{ steps.version.outputs.version }}-arm64.zip
+          generate_release_notes: true
