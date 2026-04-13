@@ -354,7 +354,11 @@ class MoonlightApp(rumps.App):
     # item, done. No repo clone, no external script on disk.
 
     def _claude_hook_command(self, state: str) -> str:
-        return f"echo -n {state} > {STATE_FILE}"
+        # Use `printf` rather than `echo -n` because Claude Code runs the
+        # hook through a shell whose `echo` builtin may not honor `-n`,
+        # leaving the literal "-n" in the state file. `printf '%s'` is
+        # POSIX-portable and always writes exactly what we want.
+        return f"printf '%s' {state} > {STATE_FILE}"
 
     def _is_moonlight_command(self, cmd_dict) -> bool:
         """True if a {type, command} dict is one of our hook commands."""
@@ -494,12 +498,13 @@ class MoonlightApp(rumps.App):
         self._write_claude_settings(settings)
 
     def _repair_claude_hooks_if_needed(self):
-        """Auto-repair hooks installed by the broken v1.0.2 menu install.
+        """Auto-repair stale Moonlight hooks in settings.json.
 
-        v1.0.2 wrote event entries as bare ``{type, command}`` dicts,
-        which Claude Code rejects as a schema error. Detect that shape
-        on launch and quietly rewrite the hooks in the correct schema.
-        No-op when settings.json is clean or doesn't exist.
+        Triggers a reinstall whenever we find a Moonlight hook that
+        doesn't match the current canonical form — either the broken
+        v1.0.2 shape (bare ``{type, command}`` at event level) or an
+        older command string like the v1.0.3 ``echo -n`` variant. A
+        no-op when settings.json is already in the current shape.
         """
         if not os.path.exists(CLAUDE_SETTINGS_FILE):
             return
@@ -507,21 +512,42 @@ class MoonlightApp(rumps.App):
         hooks = settings.get("hooks") or {}
         if not isinstance(hooks, dict):
             return
+
+        canonical = {
+            event: self._claude_hook_command(state)
+            for event, state in CLAUDE_HOOK_EVENTS
+        }
+
         needs_repair = False
-        for entries in hooks.values():
+        for event, entries in hooks.items():
             if not isinstance(entries, list):
                 continue
             for e in entries:
-                if (
-                    isinstance(e, dict)
-                    and "command" in e
-                    and "hooks" not in e
-                    and self._is_moonlight_command(e)
-                ):
-                    needs_repair = True
+                if not isinstance(e, dict):
+                    continue
+                # Broken v1.0.2 shape
+                if "command" in e and "hooks" not in e:
+                    if self._is_moonlight_command(e):
+                        needs_repair = True
+                        break
+                    continue
+                # Correct shape — check that the command text matches
+                # what the current version would write.
+                inner = e.get("hooks")
+                if not isinstance(inner, list):
+                    continue
+                for h in inner:
+                    if not self._is_moonlight_command(h):
+                        continue
+                    expected = canonical.get(event)
+                    if expected and h.get("command") != expected:
+                        needs_repair = True
+                        break
+                if needs_repair:
                     break
             if needs_repair:
                 break
+
         if needs_repair:
             log.info("Repairing Moonlight's Claude Code hooks in settings.json")
             try:
