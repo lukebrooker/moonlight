@@ -122,11 +122,10 @@ class MoonlightApp(rumps.App):
         self.ble.start(on_connection_change=self._on_ble_connection)
 
     def _build_menu(self):
-        claude_hooks_label = (
-            "Remove Claude Code Hooks"
-            if self._claude_hooks_installed()
-            else "Install Claude Code Hooks"
+        claude_hooks_item = rumps.MenuItem(
+            "Claude Code Hooks", callback=self._toggle_claude_hooks
         )
+        claude_hooks_item.state = 1 if self._claude_hooks_installed() else 0
 
         self.menu = [
             rumps.MenuItem("Status: Connecting...", callback=None),
@@ -144,7 +143,7 @@ class MoonlightApp(rumps.App):
             None,
             rumps.MenuItem("Release Lamp", callback=self._toggle_release),
             None,
-            rumps.MenuItem(claude_hooks_label, callback=self._toggle_claude_hooks),
+            claude_hooks_item,
             None,
             rumps.MenuItem("Show in Dock", callback=self._toggle_dock),
             rumps.MenuItem("Quit", callback=self._on_quit),
@@ -439,7 +438,7 @@ class MoonlightApp(rumps.App):
         try:
             if self._claude_hooks_installed():
                 self._uninstall_claude_hooks()
-                sender.title = "Install Claude Code Hooks"
+                sender.state = 0
                 rumps.alert(
                     title="Claude Code hooks removed",
                     message=(
@@ -450,7 +449,7 @@ class MoonlightApp(rumps.App):
                 )
             else:
                 self._install_claude_hooks()
-                sender.title = "Remove Claude Code Hooks"
+                sender.state = 1
                 rumps.alert(
                     title="Claude Code hooks installed",
                     message=(
