@@ -89,16 +89,14 @@ you enable Music mode.
 
 ### Claude Code session lamp
 
-If you have [Claude Code](https://claude.com/claude-code) installed, you can
-wire it into Moonlight so the lamp visually tracks session state. From a
-checkout of this repo:
+If you have [Claude Code](https://claude.com/claude-code) installed, click
+**Install Claude Code Hooks** in the Moonlight menu. Moonlight merges a
+handful of inline commands into `~/.claude/settings.json` (preserving any
+hooks you already have) and the lamp will start tracking your session the
+next time you open Claude Code.
 
-```sh
-./setup.sh
-```
-
-This installs the hook script into `~/.claude/settings.json` and your lamp
-will start reacting the next time you open Claude Code.
+To undo it later, click **Remove Claude Code Hooks** from the same spot.
+No shell commands, no repo clone, no script on disk.
 
 ## Development
 

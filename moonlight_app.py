@@ -31,6 +31,34 @@ STATE_FILE = "/tmp/moonlight_state"
 CONFIG_FILE = os.path.expanduser("~/.config/moonlight/config.json")
 LEGACY_CONFIG_FILE = os.path.expanduser("~/.config/moonside/config.json")
 
+# Claude Code hook integration.
+#
+# The lamp reacts to Claude Code sessions by watching STATE_FILE. A hook is
+# just a shell command that writes a word to that file — so we can install
+# the hooks as inline `echo` commands instead of shipping a script that
+# requires a repo checkout.
+CLAUDE_SETTINGS_FILE = os.path.expanduser("~/.claude/settings.json")
+
+# (event name in settings.json, state word to write)
+CLAUDE_HOOK_EVENTS = [
+    ("SessionStart", "idle"),
+    ("UserPromptSubmit", "working"),
+    ("Stop", "idle"),
+    ("PreToolUse", "working"),
+    ("PostToolUse", "working"),
+    ("Notification", "input"),
+    ("SessionEnd", "off"),
+]
+
+# Substrings that identify a hook as ours so we can add/remove it without
+# stomping on unrelated hooks the user has configured. Includes the old
+# script-based hook paths so upgrades from setup.sh installs get cleaned up.
+CLAUDE_HOOK_MARKERS = (
+    "/tmp/moonlight_state",
+    "moonlight_hook.sh",
+    "moonside_hook.sh",
+)
+
 # Claude Code state -> lamp command mapping
 CLAUDE_STATES = {
     "working": {"type": "theme", "theme": "BEAT2", "colors": [(255, 255, 255), (0, 0, 140)]},
@@ -94,6 +122,12 @@ class MoonlightApp(rumps.App):
         self.ble.start(on_connection_change=self._on_ble_connection)
 
     def _build_menu(self):
+        claude_hooks_label = (
+            "Remove Claude Code Hooks"
+            if self._claude_hooks_installed()
+            else "Install Claude Code Hooks"
+        )
+
         self.menu = [
             rumps.MenuItem("Status: Connecting...", callback=None),
             None,  # separator
@@ -109,6 +143,8 @@ class MoonlightApp(rumps.App):
             rumps.MenuItem("Turn Off", callback=self._on_turn_off),
             None,
             rumps.MenuItem("Release Lamp", callback=self._toggle_release),
+            None,
+            rumps.MenuItem(claude_hooks_label, callback=self._toggle_claude_hooks),
             None,
             rumps.MenuItem("Show in Dock", callback=self._toggle_dock),
             rumps.MenuItem("Quit", callback=self._on_quit),
@@ -306,6 +342,133 @@ class MoonlightApp(rumps.App):
             status_key = self._find_status_key()
             if status_key:
                 self.menu[status_key].title = "Status: Released"
+
+    # -- Claude Code hook installation --
+    #
+    # The hooks are inline `echo` commands rather than a shell script, so
+    # the app is self-contained: install Moonlight.app, click the menu
+    # item, done. No repo clone, no external script on disk.
+
+    def _claude_hook_command(self, state: str) -> str:
+        return f"echo -n {state} > {STATE_FILE}"
+
+    def _is_moonlight_hook(self, entry) -> bool:
+        """True if a Claude settings hook entry was installed by us."""
+        if not isinstance(entry, dict):
+            return False
+        cmd = entry.get("command") or ""
+        return any(marker in cmd for marker in CLAUDE_HOOK_MARKERS)
+
+    def _claude_hooks_installed(self) -> bool:
+        """Best-effort check whether our hooks are present in settings.json."""
+        if not os.path.exists(CLAUDE_SETTINGS_FILE):
+            return False
+        try:
+            with open(CLAUDE_SETTINGS_FILE) as f:
+                settings = json.load(f)
+        except Exception:
+            return False
+        hooks = settings.get("hooks") or {}
+        for entries in hooks.values():
+            if isinstance(entries, list) and any(self._is_moonlight_hook(e) for e in entries):
+                return True
+        return False
+
+    def _read_claude_settings(self) -> dict:
+        if not os.path.exists(CLAUDE_SETTINGS_FILE):
+            return {}
+        try:
+            with open(CLAUDE_SETTINGS_FILE) as f:
+                return json.load(f)
+        except Exception:
+            log.exception("Failed to read %s", CLAUDE_SETTINGS_FILE)
+            return {}
+
+    def _write_claude_settings(self, settings: dict):
+        os.makedirs(os.path.dirname(CLAUDE_SETTINGS_FILE), exist_ok=True)
+        with open(CLAUDE_SETTINGS_FILE, "w") as f:
+            json.dump(settings, f, indent=2)
+
+    def _install_claude_hooks(self):
+        """Merge Moonlight's hooks into settings.json, preserving others."""
+        settings = self._read_claude_settings()
+        hooks = settings.get("hooks") or {}
+        if not isinstance(hooks, dict):
+            hooks = {}
+
+        for event, state in CLAUDE_HOOK_EVENTS:
+            existing = hooks.get(event) or []
+            if not isinstance(existing, list):
+                existing = []
+            # Drop any stale Moonlight hook for this event, keep the rest.
+            filtered = [e for e in existing if not self._is_moonlight_hook(e)]
+            filtered.append({
+                "type": "command",
+                "command": self._claude_hook_command(state),
+            })
+            hooks[event] = filtered
+
+        settings["hooks"] = hooks
+        self._write_claude_settings(settings)
+
+    def _uninstall_claude_hooks(self):
+        """Remove Moonlight's hooks from settings.json, preserving others."""
+        if not os.path.exists(CLAUDE_SETTINGS_FILE):
+            return
+        settings = self._read_claude_settings()
+        hooks = settings.get("hooks") or {}
+        if not isinstance(hooks, dict):
+            return
+
+        cleaned = {}
+        for event, entries in hooks.items():
+            if not isinstance(entries, list):
+                cleaned[event] = entries
+                continue
+            filtered = [e for e in entries if not self._is_moonlight_hook(e)]
+            if filtered:
+                cleaned[event] = filtered
+
+        if cleaned:
+            settings["hooks"] = cleaned
+        else:
+            settings.pop("hooks", None)
+        self._write_claude_settings(settings)
+
+    def _toggle_claude_hooks(self, sender):
+        try:
+            if self._claude_hooks_installed():
+                self._uninstall_claude_hooks()
+                sender.title = "Install Claude Code Hooks"
+                rumps.alert(
+                    title="Claude Code hooks removed",
+                    message=(
+                        "Moonlight's hooks have been removed from "
+                        "~/.claude/settings.json. Open a new Claude Code "
+                        "session for the change to take effect."
+                    ),
+                )
+            else:
+                self._install_claude_hooks()
+                sender.title = "Remove Claude Code Hooks"
+                rumps.alert(
+                    title="Claude Code hooks installed",
+                    message=(
+                        "Moonlight is now wired into Claude Code.\n\n"
+                        "Switch to Claude Code mode from the Mode menu, "
+                        "then open a new Claude Code session — the lamp "
+                        "will start reacting to session events."
+                    ),
+                )
+        except Exception:
+            log.exception("Failed to toggle Claude Code hooks")
+            rumps.alert(
+                title="Couldn't update hooks",
+                message=(
+                    "Moonlight couldn't update ~/.claude/settings.json. "
+                    "Check Console.app for details."
+                ),
+            )
 
     # -- Claude Code mode --
 
