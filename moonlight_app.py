@@ -118,6 +118,11 @@ class MoonlightApp(rumps.App):
         # Dock visibility (loaded from config in _load_schedule)
         self._show_in_dock = False
 
+        # Auto-heal settings.json if we find hooks installed by the
+        # broken v1.0.2 menu flow. Runs before _build_menu so the
+        # checkmark state reflects the post-repair reality.
+        self._repair_claude_hooks_if_needed()
+
         self._build_menu()
         self.ble.start(on_connection_change=self._on_ble_connection)
 
@@ -351,25 +356,71 @@ class MoonlightApp(rumps.App):
     def _claude_hook_command(self, state: str) -> str:
         return f"echo -n {state} > {STATE_FILE}"
 
-    def _is_moonlight_hook(self, entry) -> bool:
-        """True if a Claude settings hook entry was installed by us."""
+    def _is_moonlight_command(self, cmd_dict) -> bool:
+        """True if a {type, command} dict is one of our hook commands."""
+        if not isinstance(cmd_dict, dict):
+            return False
+        cmd = cmd_dict.get("command") or ""
+        return any(marker in cmd for marker in CLAUDE_HOOK_MARKERS)
+
+    def _is_moonlight_hook_entry(self, entry) -> bool:
+        """True if an event-level entry in settings.json is one of ours.
+
+        Recognises both the correct Claude Code schema —
+        ``{"hooks": [{type, command}]}`` — and the broken v1.0.2 schema
+        where we wrote command dicts directly at the event level. The
+        latter is what we clean up when upgrading.
+        """
         if not isinstance(entry, dict):
             return False
-        cmd = entry.get("command") or ""
-        return any(marker in cmd for marker in CLAUDE_HOOK_MARKERS)
+        # Broken v1.0.2 shape: bare command dict at the event level
+        if "command" in entry and "hooks" not in entry:
+            return self._is_moonlight_command(entry)
+        # Correct shape: matcher group with a nested hooks list
+        inner = entry.get("hooks")
+        if isinstance(inner, list):
+            return any(self._is_moonlight_command(h) for h in inner)
+        return False
+
+    def _filter_moonlight_entries(self, entries: list) -> list:
+        """Return a copy of ``entries`` with all Moonlight hooks stripped.
+
+        Preserves any non-Moonlight entries untouched, including other
+        matcher groups the user has configured.
+        """
+        cleaned = []
+        for entry in entries:
+            if not isinstance(entry, dict):
+                cleaned.append(entry)
+                continue
+            # Broken v1.0.2 shape — drop wholesale if it's ours
+            if "command" in entry and "hooks" not in entry:
+                if not self._is_moonlight_command(entry):
+                    cleaned.append(entry)
+                continue
+            # Correct shape — filter the inner hooks list
+            inner = entry.get("hooks")
+            if not isinstance(inner, list):
+                cleaned.append(entry)
+                continue
+            new_inner = [h for h in inner if not self._is_moonlight_command(h)]
+            if new_inner:
+                new_entry = dict(entry)
+                new_entry["hooks"] = new_inner
+                cleaned.append(new_entry)
+            # else: the entry contained only our hooks — drop it
+        return cleaned
 
     def _claude_hooks_installed(self) -> bool:
         """Best-effort check whether our hooks are present in settings.json."""
-        if not os.path.exists(CLAUDE_SETTINGS_FILE):
-            return False
-        try:
-            with open(CLAUDE_SETTINGS_FILE) as f:
-                settings = json.load(f)
-        except Exception:
-            return False
+        settings = self._read_claude_settings()
         hooks = settings.get("hooks") or {}
+        if not isinstance(hooks, dict):
+            return False
         for entries in hooks.values():
-            if isinstance(entries, list) and any(self._is_moonlight_hook(e) for e in entries):
+            if isinstance(entries, list) and any(
+                self._is_moonlight_hook_entry(e) for e in entries
+            ):
                 return True
         return False
 
@@ -389,7 +440,12 @@ class MoonlightApp(rumps.App):
             json.dump(settings, f, indent=2)
 
     def _install_claude_hooks(self):
-        """Merge Moonlight's hooks into settings.json, preserving others."""
+        """Merge Moonlight's hooks into settings.json, preserving others.
+
+        Uses Claude Code's matcher-group schema: each event gets a group
+        ``{"hooks": [{type, command}]}``. Matcher is omitted since we want
+        the hook to run for every event occurrence.
+        """
         settings = self._read_claude_settings()
         hooks = settings.get("hooks") or {}
         if not isinstance(hooks, dict):
@@ -399,11 +455,14 @@ class MoonlightApp(rumps.App):
             existing = hooks.get(event) or []
             if not isinstance(existing, list):
                 existing = []
-            # Drop any stale Moonlight hook for this event, keep the rest.
-            filtered = [e for e in existing if not self._is_moonlight_hook(e)]
+            filtered = self._filter_moonlight_entries(existing)
             filtered.append({
-                "type": "command",
-                "command": self._claude_hook_command(state),
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": self._claude_hook_command(state),
+                    }
+                ]
             })
             hooks[event] = filtered
 
@@ -424,7 +483,7 @@ class MoonlightApp(rumps.App):
             if not isinstance(entries, list):
                 cleaned[event] = entries
                 continue
-            filtered = [e for e in entries if not self._is_moonlight_hook(e)]
+            filtered = self._filter_moonlight_entries(entries)
             if filtered:
                 cleaned[event] = filtered
 
@@ -433,6 +492,42 @@ class MoonlightApp(rumps.App):
         else:
             settings.pop("hooks", None)
         self._write_claude_settings(settings)
+
+    def _repair_claude_hooks_if_needed(self):
+        """Auto-repair hooks installed by the broken v1.0.2 menu install.
+
+        v1.0.2 wrote event entries as bare ``{type, command}`` dicts,
+        which Claude Code rejects as a schema error. Detect that shape
+        on launch and quietly rewrite the hooks in the correct schema.
+        No-op when settings.json is clean or doesn't exist.
+        """
+        if not os.path.exists(CLAUDE_SETTINGS_FILE):
+            return
+        settings = self._read_claude_settings()
+        hooks = settings.get("hooks") or {}
+        if not isinstance(hooks, dict):
+            return
+        needs_repair = False
+        for entries in hooks.values():
+            if not isinstance(entries, list):
+                continue
+            for e in entries:
+                if (
+                    isinstance(e, dict)
+                    and "command" in e
+                    and "hooks" not in e
+                    and self._is_moonlight_command(e)
+                ):
+                    needs_repair = True
+                    break
+            if needs_repair:
+                break
+        if needs_repair:
+            log.info("Repairing Moonlight's Claude Code hooks in settings.json")
+            try:
+                self._install_claude_hooks()
+            except Exception:
+                log.exception("Failed to repair Claude Code hooks")
 
     def _toggle_claude_hooks(self, sender):
         try:
