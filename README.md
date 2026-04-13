@@ -23,6 +23,8 @@ music visualizer.
   beat detection
 - **Dock toggle** — runs as a menu bar accessory by default; show in the
   Dock with one click if you prefer
+- **Multi-Mac handoff** — release the lamp from one Mac with a single click
+  so another can pick it up, without quitting the app
 
 ## Install
 
@@ -46,6 +48,28 @@ delivered over the internet. `xattr -cr` strips the quarantine extended
 attribute; after that, macOS will still ask once whether you want to open
 it. This is a known limitation and will be resolved once the project moves
 to a signed, notarized build.
+
+## Using Moonlight on multiple Macs
+
+The Moonside Halo, like most consumer BLE peripherals, only lets one
+central (one Mac) hold the connection at a time. If Moonlight is running
+on Mac A and you open it on Mac B, Mac B will see the lamp advertising
+but won't be able to connect — the menu bar will show
+**Status: Held by another device**.
+
+To hand the lamp off without quitting:
+
+1. On the Mac that currently has the lamp, click the Moonlight menu and
+   choose **Release Lamp**. The status changes to **Released** and the
+   icon goes to 🌜.
+2. On the other Mac, Moonlight will pick the lamp up within a few seconds
+   (or click **Reconnect Lamp** if you had released it there too).
+3. To take the lamp back, click **Reconnect Lamp** on the first Mac — just
+   make sure you've released it on the other one first.
+
+Quitting Moonlight also releases the lamp, so the old "quit on Mac A,
+launch on Mac B" flow still works. Release Lamp just saves you the
+relaunch.
 
 ## Optional setup
 

@@ -108,6 +108,8 @@ class MoonlightApp(rumps.App):
             rumps.MenuItem("Turn On", callback=self._on_turn_on),
             rumps.MenuItem("Turn Off", callback=self._on_turn_off),
             None,
+            rumps.MenuItem("Release Lamp", callback=self._toggle_release),
+            None,
             rumps.MenuItem("Show in Dock", callback=self._toggle_dock),
             rumps.MenuItem("Quit", callback=self._on_quit),
         ]
@@ -186,16 +188,28 @@ class MoonlightApp(rumps.App):
 
     def _on_ble_connection(self, connected: bool):
         """Called from BLE thread when connection state changes."""
+        status_key = self._find_status_key()
         if connected:
             self.title = "🌙"
-            self.menu["Status: Connecting..."].title = "Status: Connected"
+            if status_key:
+                self.menu[status_key].title = "Status: Connected"
             # Set initial brightness
             self.ble.send_brightness(self._brightness)
         else:
-            self.title = "🌑"
-            status_key = self._find_status_key()
+            # Three disconnect flavors we want to distinguish in the menu:
+            # released (we intentionally let go), held-by-other (another Mac
+            # owns the lamp), plain disconnected (lamp off / out of range).
+            if self.ble.released:
+                self.title = "🌜"
+                new_title = "Status: Released"
+            elif self.ble.held_by_other:
+                self.title = "🌒"
+                new_title = "Status: Held by another device"
+            else:
+                self.title = "🌑"
+                new_title = "Status: Disconnected"
             if status_key:
-                self.menu[status_key].title = "Status: Disconnected"
+                self.menu[status_key].title = new_title
 
     def _find_status_key(self) -> str | None:
         for key in self.menu:
@@ -273,6 +287,25 @@ class MoonlightApp(rumps.App):
 
     def _on_turn_off(self, sender):
         self.ble.send_off()
+
+    def _toggle_release(self, sender):
+        """Hand the lamp off to another Mac without quitting.
+
+        Disconnects our BLE client and pauses the reconnect loop so another
+        central (another Mac) can grab the lamp. Click again to resume.
+        """
+        if self.ble.released:
+            self.ble.resume()
+            sender.title = "Release Lamp"
+        else:
+            self.ble.release()
+            sender.title = "Reconnect Lamp"
+            # Update status immediately — the BLE callback will fire too,
+            # but only after the current connection tears down.
+            self.title = "🌜"
+            status_key = self._find_status_key()
+            if status_key:
+                self.menu[status_key].title = "Status: Released"
 
     # -- Claude Code mode --
 

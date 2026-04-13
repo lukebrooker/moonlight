@@ -32,11 +32,26 @@ class MoonlightBLE:
         self._cmd_queue: queue.Queue[str | None] = queue.Queue()
         self._connected = threading.Event()
         self._stopping = False
+        # _paused suspends the (re)connect loop without tearing the thread
+        # down, so the user can release the lamp on one Mac and pick it up
+        # on another without quitting the app.
+        self._paused = threading.Event()
+        # Set when the scanner finds the lamp but connect() fails — the
+        # usual signature of another central already holding the link.
+        self._held_by_other = False
         self._on_connection_change: callable = None
 
     @property
     def connected(self) -> bool:
         return self._connected.is_set()
+
+    @property
+    def released(self) -> bool:
+        return self._paused.is_set()
+
+    @property
+    def held_by_other(self) -> bool:
+        return self._held_by_other
 
     def start(self, on_connection_change: callable = None):
         """Start the BLE manager in a background thread."""
@@ -58,6 +73,21 @@ class MoonlightBLE:
         """Queue a command to send to the lamp. Thread-safe."""
         if not self._stopping:
             self._cmd_queue.put(command)
+
+    def release(self):
+        """Disconnect and pause the reconnect loop.
+
+        Lets the user hand the lamp off to another Mac without quitting
+        the app. Call resume() to start scanning/reconnecting again.
+        """
+        self._paused.set()
+        self._held_by_other = False
+        if self._loop and self._loop.is_running():
+            asyncio.run_coroutine_threadsafe(self._shutdown(), self._loop)
+
+    def resume(self):
+        """Resume scanning and reconnecting after release()."""
+        self._paused.clear()
 
     def send_color(self, r: int, g: int, b: int):
         """Send a solid color command."""
@@ -93,6 +123,13 @@ class MoonlightBLE:
     async def _main(self):
         """Main async loop: connect, then process commands."""
         while not self._stopping:
+            # Honor release(): park here without tearing the thread down so
+            # resume() can pick up where we left off.
+            while self._paused.is_set() and not self._stopping:
+                await asyncio.sleep(0.2)
+            if self._stopping:
+                break
+
             try:
                 await self._connect()
                 if self._client and self._client.is_connected:
@@ -105,7 +142,7 @@ class MoonlightBLE:
                 self._connected.clear()
                 self._notify_connection(False)
 
-            if not self._stopping:
+            if not self._stopping and not self._paused.is_set():
                 log.info("Reconnecting in 3s...")
                 await asyncio.sleep(3)
 
@@ -115,7 +152,14 @@ class MoonlightBLE:
 
         if self.device_address:
             self._client = BleakClient(self.device_address)
-            await self._client.connect(timeout=10)
+            try:
+                await self._client.connect(timeout=10)
+            except Exception:
+                # Scanner found it (we have the address) but connect failed
+                # — the classic signature of another central holding the link.
+                self._held_by_other = True
+                raise
+            self._held_by_other = False
             log.info(f"Connected to {self.device_address}")
             return
 
@@ -131,11 +175,22 @@ class MoonlightBLE:
                     break
 
         if not device:
+            # Genuinely not in range / not advertising — clear the
+            # held-by-other flag so we don't confuse "lamp off" with
+            # "another Mac has it".
+            self._held_by_other = False
             raise ConnectionError("No Moonside Halo lamp found")
 
         log.info(f"Found {device.name} ({device.address})")
         self._client = BleakClient(device.address)
-        await self._client.connect(timeout=10)
+        try:
+            await self._client.connect(timeout=10)
+        except Exception:
+            # We saw it advertising but couldn't connect — almost always
+            # means another central already owns it.
+            self._held_by_other = True
+            raise
+        self._held_by_other = False
         log.info("Connected")
 
     async def _process_commands(self):
